@@ -59,3 +59,5 @@ dkms.conf
 
 # Compiled programs
 bin/
+cuda-multi-layer-nn
+multi-layer-nn
