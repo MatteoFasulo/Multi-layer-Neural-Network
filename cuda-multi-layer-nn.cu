@@ -75,6 +75,27 @@ int compute_layer_size(const int N, const int t)
     return N - t*(R - 1);
 }
 
+/* Define the compute_throughput function */
+/**
+ * Compute the throughput of the network.
+ *
+ * @param time The time taken to compute the network.
+ * @param N The number of neurons in the first layer.
+ * @param K The number of layers.
+ * @return The throughput of the network.
+ */
+
+double compute_throughput(const double time, const int N, const int K)
+{
+    int processed_items = 0;
+    for (int t = 1; t <= K - 1; t++)
+    {
+        processed_items += compute_layer_size(N, t);
+    }
+    return processed_items / time;
+
+}
+
 /* Define the forward_propagation kernel without shared memory */
 /**
  * Forward propagation kernel. Each thread computes the output of a single neuron in the output layer.
@@ -250,7 +271,7 @@ int main(int argc, char *argv[])
     printf("%fs\n", tnoshared);
 
     // Calculate throughput
-    throughput = N / tnoshared; // items per second
+    throughput = compute_throughput(tnoshared, N, K);
     printf("Throughput: %f items/second\n", throughput);
 
     // Copy the output layer back to the host
@@ -302,7 +323,7 @@ int main(int argc, char *argv[])
     printf("%fs (%.2fx speedup)\n", tshared, tnoshared / tshared);
 
     // Calculate throughput
-    shared_throughput = N / tshared; // items per second
+    shared_throughput = compute_throughput(tshared, N, K);
     printf("Throughput: %f items/second\n", shared_throughput);
 
 
