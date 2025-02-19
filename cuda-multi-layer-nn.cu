@@ -135,7 +135,7 @@ int compute_layer_size(const int N, const int t)
  * @param K The number of layers.
  * @return The throughput of the network.
  */
-double compute_throughput(const double time, const int N, const int K)
+int compute_throughput(const double time, const int N, const int K)
 {
     int processed_items = 0;
     for (int t = 1; t <= K - 1; t++)
@@ -230,7 +230,7 @@ int main(int argc, char *argv[])
     int K = 2;     // Number of layers
     int M; // Size of the output layer
     double tstart, tstop, tnoshared, tshared; // Timers
-    double throughput, shared_throughput; // Throughput in items per second
+    int throughput, shared_throughput; // Throughput in items per second
 
     if (argc > 3)
     {
@@ -305,7 +305,7 @@ int main(int argc, char *argv[])
 
     // Calculate throughput
     throughput = compute_throughput(tnoshared, N, K);
-    printf("Throughput: %f items/second\n", throughput);
+    printf("Throughput:\t\t%d items/second\n", throughput);
 
     // Copy the output layer back to the host
     h_y = (float *)malloc(final_layer_size * sizeof(float)); 
@@ -353,7 +353,7 @@ int main(int argc, char *argv[])
 
     // Calculate throughput
     shared_throughput = compute_throughput(tshared, N, K);
-    printf("Throughput: %f items/second\n", shared_throughput);
+    printf("Throughput:\t\t%d items/second\n", shared_throughput);
 
     // Copy the output layer back to the host
     h_y_shared = (float *)malloc(final_layer_size * sizeof(float)); 
