@@ -294,9 +294,7 @@ int main(int argc, char *argv[])
         if (t < K - 1)
         {
             // Swap the input and output arays if we are not at the last layer
-            float *temp = d_nn.x;
-            d_nn.x = d_nn.y;
-            d_nn.y = temp;
+            cudaMemcpy(d_nn.x, d_nn.y, output_layer_size * sizeof(float), cudaMemcpyDeviceToDevice);
         }
     }
     cudaDeviceSynchronize();
@@ -343,9 +341,7 @@ int main(int argc, char *argv[])
         if (t < K - 1)
         {
             // Swap the input and output arays if we are not at the last layer
-            float *temp = d_nn_shared.x;
-            d_nn_shared.x = d_nn_shared.y;
-            d_nn_shared.y = temp;
+            cudaMemcpy(d_nn_shared.x, d_nn_shared.y, output_layer_size * sizeof(float), cudaMemcpyDeviceToDevice);
         }
     }
     cudaDeviceSynchronize();
