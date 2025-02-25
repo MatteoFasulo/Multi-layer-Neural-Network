@@ -44,7 +44,7 @@
  * @param W The weights.
  * @param y The output layer.
  */
-struct NeuralNet {
+struct __align__(16) NeuralNet {
     float *x;
     float *W;
     float *y;
@@ -67,7 +67,7 @@ void allocateNeuralNet(NeuralNet &net, const int N, const int M) {
     
     // cudaMalloc returns memory that is usually aligned to 256 bytes.
     float *base_ptr = nullptr;
-    cudaSafeCall(cudaMalloc((void **)&base_ptr, total_size));
+    cudaMalloc((void **)&base_ptr, total_size);
     
     // Slice up the contiguous allocation.
     net.x = base_ptr;
@@ -168,15 +168,25 @@ __global__ void forward_propagation_shared(
 ) {
     // Shared memory for the input stencil window
     __shared__ float temp[BLKDIM + 2 * RADIUS];
+    __shared__ float shared_W[R][BLKDIM];
 
     int lindex = threadIdx.x + RADIUS;
     int gindex = threadIdx.x + blockIdx.x * blockDim.x + RADIUS;
+    float sum = BIAS;
 
     // Load center element with bounds checking
     if (gindex < in_size) {  // Add size check for main element
         temp[lindex] = net.x[gindex];
     } else {
         temp[lindex] = 0;
+    }
+
+    // Load weights into shared memory
+    // Each thread loads R/blockDim.x weights
+    for (int row = threadIdx.x; row < R; row += blockDim.x) {
+        if (gindex < out_size + RADIUS) {
+            shared_W[row][threadIdx.x] = net.W[row * out_size + gindex];
+        }
     }
 
     // Load halo elements with bounds checking
@@ -199,10 +209,10 @@ __global__ void forward_propagation_shared(
     
     // Compute only for valid output indices
     if (gindex < out_size + RADIUS) {
-        float sum = BIAS;
+        
         for (int offset = -RADIUS; offset <= RADIUS; offset++) {
             int row = offset + RADIUS; // 0,1,2 for R=3
-            sum += temp[lindex + offset] * net.W[row * out_size + gindex];
+            sum += temp[lindex + offset] * shared_W[row][threadIdx.x];
         }
         net.y[gindex] = sigmoid(sum);
     }
@@ -211,7 +221,7 @@ __global__ void forward_propagation_shared(
 int main(int argc, char *argv[])
 {
     float *h_x, *h_W, *h_y, *h_y_shared; // Host memory for x, W, and y
-    int N = 1024;  // Number of neurons in the first layer
+    int N = BLKDIM;  // Number of neurons in the first layer
     int K = 2;     // Number of layers
     int M;
     double tstart, tstop, tnoshared, tshared; // Timers
@@ -251,10 +261,13 @@ int main(int argc, char *argv[])
     h_W = (float *)malloc(N * R * sizeof(float)); fill(h_W, N * R);
     
     // Copy x and W to device memory
-    cudaSafeCall(cudaMemcpy(d_nn.x, h_x, (N+2*RADIUS) * sizeof(float), cudaMemcpyHostToDevice));
-    cudaSafeCall(cudaMemcpy(d_nn.W, h_W, N * R * sizeof(float), cudaMemcpyHostToDevice));
+    cudaMemcpy(d_nn.x, h_x, (N+2*RADIUS) * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_nn.W, h_W, N * R * sizeof(float), cudaMemcpyHostToDevice);
 
     int final_layer_size = compute_layer_size(N, K - 1);
+
+    printf("N = %d, K = %d, R = %d\n", N, K, R);
+    printf("BLKDIM = %d\n", BLKDIM);
 
     /**
      ** Forward propagation without shared memory
@@ -296,7 +309,7 @@ int main(int argc, char *argv[])
 
     // Copy the output layer back to the host
     h_y = (float *)malloc((final_layer_size+2*RADIUS) * sizeof(float)); 
-    cudaSafeCall(cudaMemcpy(h_y, d_nn.y, (final_layer_size+2*RADIUS) * sizeof(float), cudaMemcpyDeviceToHost));
+    cudaMemcpy(h_y, d_nn.y, (final_layer_size+2*RADIUS) * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Clean up host and device allocations.
     freeNeuralNet(d_nn);
@@ -306,8 +319,8 @@ int main(int argc, char *argv[])
     allocateNeuralNet(d_nn_shared, N, M);
     
     // Copy x and W to device memory
-    cudaSafeCall(cudaMemcpy(d_nn_shared.x, h_x, (N+2*RADIUS) * sizeof(float), cudaMemcpyHostToDevice));
-    cudaSafeCall(cudaMemcpy(d_nn_shared.W, h_W, N * R * sizeof(float), cudaMemcpyHostToDevice));
+    cudaMemcpy(d_nn_shared.x, h_x, (N+2*RADIUS) * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_nn_shared.W, h_W, N * R * sizeof(float), cudaMemcpyHostToDevice);
 
 
     printf("Shared memory:\t\t");
