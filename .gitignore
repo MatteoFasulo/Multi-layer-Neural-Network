@@ -61,3 +61,6 @@ dkms.conf
 bin/
 cuda-multi-layer-nn
 multi-layer-nn
+
+# Slurm jobs output
+*.out
