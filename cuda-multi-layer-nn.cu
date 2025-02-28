@@ -34,7 +34,7 @@
 #define BLKDIM 1024
 #define R 3
 #define RADIUS R / 2
-#define BIAS 0.0
+#define BIAS 0.2
 
 /* Define the NeuralNet struct */
 /**
@@ -96,7 +96,7 @@ void freeNeuralNet(NeuralNet &net) {
  */
 __device__ float sigmoid(const float x)
 {
-    return x;
+    return 1.0 / (1.0 + exp(-x));
 }
 
 /* Define the fill function */
@@ -110,7 +110,7 @@ void fill(float *array, const size_t size)
 {
     for (size_t i = 0; i < size; i++)
     {
-        array[i] = 1.0f;
+        array[i] = ((double)rand() / RAND_MAX);
     }
 }
 
@@ -167,25 +167,23 @@ __global__ void forward_propagation_shared(
     const int out_size
 ) {
     // Shared memory for the input stencil window
-    __shared__ float temp[BLKDIM + 2 * RADIUS];
+    __shared__ float shared_x[BLKDIM + 2 * RADIUS];
     __shared__ float shared_W[R][BLKDIM];
 
     int lindex = threadIdx.x + RADIUS;
     int gindex = threadIdx.x + blockIdx.x * blockDim.x + RADIUS;
-    float sum = BIAS;
 
-    // Load center element with bounds checking
+    // Load input data into shared memory with bounds checking
     if (gindex < in_size) {  // Add size check for main element
-        temp[lindex] = net.x[gindex];
+        shared_x[lindex] = net.x[gindex];
     } else {
-        temp[lindex] = 0;
+        shared_x[lindex] = 0;
     }
 
     // Load weights into shared memory
-    // Each thread loads R/blockDim.x weights
-    for (int row = threadIdx.x; row < R; row += blockDim.x) {
-        if (gindex < out_size + RADIUS) {
-            shared_W[row][threadIdx.x] = net.W[row * out_size + gindex];
+    if (gindex < out_size + RADIUS) {
+        for (int r = 0; r < R; r++) {
+            shared_W[r][threadIdx.x] = net.W[(r * out_size) + gindex];
         }
     }
 
@@ -193,27 +191,28 @@ __global__ void forward_propagation_shared(
     if (threadIdx.x < RADIUS) {
         // Left halo
         if (gindex >= RADIUS) {
-            temp[lindex - RADIUS] = net.x[gindex - RADIUS];
+            shared_x[lindex - RADIUS] = net.x[gindex - RADIUS];
         } else {
-            temp[lindex - RADIUS] = 0;
+            shared_x[lindex - RADIUS] = 0;
         }
         
         // Right halo
         if (gindex + blockDim.x < in_size) {
-            temp[lindex + blockDim.x] = net.x[gindex + blockDim.x];
+            shared_x[lindex + blockDim.x] = net.x[gindex + blockDim.x];
         } else {
-            temp[lindex + blockDim.x] = 0;
+            shared_x[lindex + blockDim.x] = 0;
         }
     }
     __syncthreads(); 
     
     // Compute only for valid output indices
     if (gindex < out_size + RADIUS) {
-        
+        float sum = BIAS;
         for (int offset = -RADIUS; offset <= RADIUS; offset++) {
-            int row = offset + RADIUS; // 0,1,2 for R=3
-            sum += temp[lindex + offset] * shared_W[row][threadIdx.x];
+            int row = offset + RADIUS;
+            sum += shared_x[lindex + offset] * shared_W[row][threadIdx.x];
         }
+
         net.y[gindex] = sigmoid(sum);
     }
 }
@@ -363,15 +362,13 @@ int main(int argc, char *argv[])
     cudaMemcpy(h_y_shared, d_nn_shared.y, (final_layer_size+2*RADIUS) * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Check if the results are the same
-    for (int i = RADIUS; i < final_layer_size+RADIUS; i++)
-    {
-        if (fabs(h_y[i] - h_y_shared[i]) > 1e-6)
-        {
-            fprintf(stderr, "Results do not match at index %d: %f != %f\n", i, h_y[i], h_y_shared[i]);
-            return EXIT_FAILURE;
-        }
+    int a = memcmp(h_y, h_y_shared, (final_layer_size+2*RADIUS) * sizeof(float));
+    if (!a) {
+        printf("Test OK, results match\n");
+    } else {
+        printf("Test failed, results do not match\n");
+        return EXIT_FAILURE;
     }
-    printf("Test OK, results match\n");
 
     // Clean up host and device allocations.
     freeNeuralNet(d_nn_shared);

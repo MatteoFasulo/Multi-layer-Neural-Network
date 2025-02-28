@@ -95,9 +95,9 @@ void forward_pass(
     #pragma omp parallel for schedule(static) default(none) shared(x, W, y, n)
     for (int i = 0; i < n; i++) {
         double sum = BIAS;
-        sum += x[i+0] * W[(i * R) + 0] +
-               x[i+1] * W[(i * R) + 1] +
-               x[i+2] * W[(i * R) + 2];
+        for (int j = 0; j < R; j++) {
+            sum += x[i + j] * W[(i * R) + j];
+        }
 
         y[i] = sigmoid(sum);
     }
