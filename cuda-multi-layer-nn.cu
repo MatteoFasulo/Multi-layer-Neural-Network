@@ -32,162 +32,154 @@
 #include <string.h>
 
 #define BLKDIM 1024
-#define R 3
-#define BIAS 0.2
+#define R      3
+#define RADIUS ((R-1)/2)
+#define BIAS   0.2f
+
+/* Define the NeuralNet struct */
+/**
+ * Neural network struct.
+ * @param base The base pointer for the allocated memory.
+ * @param x The input layer.
+ * @param W The weights.
+ * @param y The output layer.
+ */
+ typedef struct {
+    float *base;   /* original cudaMalloc pointer */
+    float *x;      /* input buffer */
+    float *W;      /* weight buffer */
+    float *y;      /* output buffer */
+} NeuralNet;
+
+/* Compute input size for layer `t`: layer 1 sees N, layer 2 sees N-(R-1), ... */
+static inline int input_size(int N0, int layer) {
+    return N0 - (layer-1)*(R-1);
+}
+
+/* Compute output size of layer `t`: #neurons = N0 - t*(R-1) */
+static inline int output_size(int N0, int layer) {
+    return N0 - layer*(R-1);
+}
+
+/* Allocate one big chunk for x, W, and y, then slice it up */
+void allocateNeuralNet(NeuralNet *net, int N, int M) {
+    size_t size_x = (N + 2 * RADIUS) * sizeof(float);
+    size_t size_W = N * R * sizeof(float);
+    size_t size_y = (M + 2 * RADIUS) * sizeof(float);
+    size_t total_size = size_x + size_W + size_y;
+
+    cudaError_t err = cudaMalloc(&net->base, total_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "cudaMalloc failed: %s\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+    
+    net->x = net->base;
+    net->W = (float *)((char *)net->base + size_x);
+    net->y = (float *)((char *)net->base + size_x + size_W);
+}
+
+/* Free the single allocation */
+void freeNeuralNet(NeuralNet *net) {
+    if (net->base) {
+        cudaFree(net->base);
+        net->base = net->x = net->W = net->y = NULL;
+    }
+}
 
 /* Define the Sigmoid function using the math.h lib*/
 /**
  * Sigmoid activation function.
  *
- * @param x Input value.
+ * @param v Input value.
  * @return The sigmoid of the input value.
  */
-__device__ inline float sigmoid(const float x)
+__device__ float sigmoid(const float v)
 {
-    return 1.0f / (1.0f + exp(-x));
+    return 1.0f / (1.0f + expf(-v));
 }
 
 /* Define the fill function */
 /**
  * Fill an array with random values.
  *
- * @param array The array to fill.
+ * @param arr The array to fill.
  * @param size The size of the array.
  */
-void fill(float *array, const size_t size)
+void fill(float *arr, size_t size)
 {
-    for (size_t i = 0; i < size; i++)
+    for (size_t i = 0; i < size; ++i)
     {
-        array[i] = ((float)rand() / RAND_MAX);
+        arr[i] = (float)rand() / (float)RAND_MAX;
     }
 }
 
-/* Define the compute_layer_size function */
-/**
- * Compute the size of a layer in the network.
- *
- * @param N The number of neurons in the first layer.
- * @param t The layer index.
- * @return The size of the layer.
- */
-int compute_layer_size(const int N, const int t)
-{
-    return N - t*(R - 1);
-}
-
-/* Define the compute_throughput function */
-/**
- * Compute the throughput of the network.
- *
- * @param time The time taken to compute the network.
- * @param N The number of neurons in the first layer.
- * @param K The number of layers.
- * @return The throughput of the network.
- */
-
-double compute_throughput(const double time, const int N, const int K)
-{
-    int processed_items = 0;
-    for (int t = 1; t <= K - 1; t++)
-    {
-        processed_items += compute_layer_size(N, t);
-    }
-    return processed_items / time;
-
+/* CPU-side throughput calculation: sum output sizes of layers 1..K-1 */
+double compute_throughput(long long N0, int K, double secs) {
+    long long total = 0;
+    for (int t = 1; t <= K-1; ++t)
+        total += output_size((int)N0, t);
+    return total / secs;
 }
 
 /* Define the forward_propagation kernel without shared memory */
-/**
- * Forward propagation kernel. Each thread computes the output of a single neuron in the output layer.
- *
- * @param x Input layer.
- * @param W Weights.
- * @param y Output layer.
- * @param in_size Current input layer size.
- */
 __global__ void forward_propagation(
     const float* x,
     const float* W,
     float* y,
-    const int in_size
+    int out_size
 ) {
+    const int index = threadIdx.x + blockIdx.x * blockDim.x + RADIUS;
+    if (index >= out_size) return;
 
-    /* Compute the index of the current thread */
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    int output_size = in_size - R + 1;
+    float sum = BIAS;
 
-
-    /* Compute the output for this thread */
-    if (i < output_size) {
-        float sum = BIAS;
-        sum += x[i + 0] * W[(i * R) + 0] +
-               x[i + 1] * W[(i * R) + 1] +
-               x[i + 2] * W[(i * R) + 2];
-
-        y[i] = sigmoid(sum);
+    #pragma unroll
+    for (int offset = -RADIUS; offset <= RADIUS; offset++) {
+        sum += x[index + offset] * W[index + out_size * (offset + RADIUS)];
     }
+
+    y[index] = sigmoid(sum);
 }
 
 /* Define the forward_propagation kernel with shared memory */
-/**
- * Forward propagation kernel with shared memory. Each thread computes the output of a single neuron in the output layer. Shared memory is used to store the input layer since it is accessed multiple times by adjacent threads.
- *
- * @param x Input layer.
- * @param W Weights.
- * @param y Output layer.
- * @param in_size Current input layer size.
- */
 __global__ void forward_propagation_shared(
-    const float* __restrict__ x,
-    const float* __restrict__ W,
+    const float* x,
+    const float* W,
     float* y,
-    const int in_size
+    int in_size,
+    int out_size
 ) {
+    // Shared memory for the input stencil window
+    __shared__ float temp[BLKDIM + 2 * RADIUS];
 
-    // Declare shared memory
-    __shared__ float shared_x[BLKDIM + R - 1];
+    const int gindex = threadIdx.x + blockIdx.x * blockDim.x + RADIUS;
+    const int lindex = threadIdx.x + RADIUS;
 
-    /* Compute the index of the current thread */
-    int global_index = threadIdx.x + blockIdx.x * blockDim.x;
-    int local_index = threadIdx.x; 
-
-    // Load the main portion of input into shared memory
-    if (global_index < in_size) {
-        shared_x[local_index] = x[global_index];
-    } else {
-        shared_x[local_index] = 0.0f;
+    /* Read input elements into shared memory */
+    temp[lindex] = x[gindex];
+    if (threadIdx.x < RADIUS) {
+        temp[lindex - RADIUS] = x[gindex - RADIUS];
+        temp[lindex + blockDim.x] = x[gindex + blockDim.x];
     }
-
-    // Load the extra (R - 1) elements for the boundaries.
-    if (threadIdx.x < R - 1) {
-        int load_index = global_index + blockDim.x;
-        shared_x[local_index + blockDim.x] = (load_index < in_size) ? x[load_index] : 0.0f;
-    }
-
     __syncthreads();
-    
-    // Compute the output layer size
-    int output_size = in_size - R + 1;
-    
-    // Only threads corresponding to valid output indices compute the result.
-    if (global_index < output_size) {
-        float sum = BIAS;
-        // Manual unrolling since R is known at compile time.
-        sum += shared_x[local_index + 0] * W[(global_index * R) + 0] +
-               shared_x[local_index + 1] * W[(global_index * R) + 1] +
-               shared_x[local_index + 2] * W[(global_index * R) + 2];
 
-        y[global_index] = sigmoid(sum);
+    float sum = BIAS;
+
+    #pragma unroll
+    for (int offset = -RADIUS ; offset <= RADIUS ; offset++) {
+        sum += temp[lindex + offset] * W[gindex + out_size * (offset + RADIUS)];
     }
+
+    y[gindex] = sigmoid(sum);
 }
 
 int main(int argc, char *argv[])
 {
-    float *h_x, *h_W, *h_y; // Host memory for x, W, and y
-    float *d_x, *d_W, *d_y; // Device memory for x, W, and y
-    int N = 1024;  // Number of neurons in the first layer
+    float *h_x, *h_W, *h_y, *h_y_shared; // Host memory for x, W, and y
+    int N = BLKDIM;  // Number of neurons in the first layer
     int K = 2;     // Number of layers
-    int M; // Size of the output layer
+    int M;
     double tstart, tstop, tnoshared, tshared; // Timers
     double throughput, shared_throughput; // Throughput in items per second
 
@@ -214,25 +206,24 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
-    // Compute the size of the output layer
-    M = N - R + 1;
+    // Compute the size of the first output layer
+    M = N - (R - 1);
 
-    // Allocate host memory for x, W, and y
-    h_x = (float *)malloc(N * sizeof(float)); fill(h_x, N);
-    h_W = (float *)malloc(N * R * sizeof(float)); fill(h_W, N * R);
-    h_y = (float *)malloc(M * sizeof(float)); 
+    NeuralNet d_nn;
+    allocateNeuralNet(&d_nn, N, M);
 
-    // Allocate device memory for x, W, and y
-    cudaMalloc((void **)&d_x, N * sizeof(float));
-    cudaMalloc((void **)&d_y, M * sizeof(float));
-    cudaMalloc((void **)&d_W, N * R * sizeof(float));
+    // Allocate host memory for x, W
+    h_x = (float *)malloc((N+2*RADIUS)*sizeof(float)); fill(h_x, (N+2*RADIUS));
+    h_W = (float *)malloc(N*R*sizeof(float)); fill(h_W, N * R);
     
     // Copy x and W to device memory
-    cudaMemcpy(d_x, h_x, N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_W, h_W, N * R * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_nn.x, h_x, (N+2*RADIUS)*sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_nn.W, h_W, N*R*sizeof(float), cudaMemcpyHostToDevice);
 
-    // Compute the size of the final layer
-    const int final_layer_size = compute_layer_size(N, R);
+    int final_layer_size = output_size(N, K - 1);
+
+    printf("Number of neurons (N) = %d, Number of layers (K) = %d, Radius (R) = %d\n", N, K, R);
+    printf("BLKDIM = %d\n", BLKDIM);
 
     /**
      ** Forward propagation without shared memory
@@ -245,77 +236,72 @@ int main(int argc, char *argv[])
     // Forward propagation without shared memory
     for (int t = 1; t <= K - 1; t++)
     {
-        int output_layer_size = compute_layer_size(N, t);
+        int out_sz = output_size(N, t);
 
         // Launch the kernel
-        forward_propagation<<<(N + BLKDIM - 1)/BLKDIM, BLKDIM>>>(
-            d_x,
-            d_W,
-            d_y,
-            output_layer_size
+        forward_propagation<<<(out_sz + BLKDIM - 1) / BLKDIM, BLKDIM>>>(
+            d_nn.x, d_nn.W, d_nn.y,
+            out_sz
         );
-
-        cudaDeviceSynchronize();
 
         if (t < K - 1)
         {
             // Swap the input and output arays if we are not at the last layer
-            float *temp = d_x;
-            d_x = d_y;
-            d_y = temp;
+            float *temp = d_nn.x;
+            d_nn.x = d_nn.y;
+            d_nn.y = temp;
         }
     }
+    cudaDeviceSynchronize();
     // Stop the time
     tstop = hpc_gettime();
     tnoshared = tstop - tstart;
     printf("%fs\n", tnoshared);
 
     // Calculate throughput
-    throughput = compute_throughput(tnoshared, N, K);
-    printf("Throughput: %f items/second\n", throughput);
+    throughput = compute_throughput(N, K, tnoshared);
+    printf("Throughput:\t\t%f items/second\n", throughput);
 
     // Copy the output layer back to the host
-    cudaMemcpy(h_y, d_y, final_layer_size * sizeof(float), cudaMemcpyDeviceToHost);
+    h_y = (float *)malloc((final_layer_size+(2*RADIUS)) * sizeof(float)); 
+    cudaMemcpy(h_y, d_nn.y, (final_layer_size+(2*RADIUS)) * sizeof(float), cudaMemcpyDeviceToHost);
 
-    cudaMemset(d_x, 0, N * sizeof(float)); // zero out the input layer to ensure that we don't read the wrong values 
-    memset(h_x, 0, N * sizeof(float)); // zero out the input layer to ensure that we don't read the wrong values
-    cudaMemset(d_y, 0, final_layer_size * sizeof(float)); // zero out the output layer to ensure that we don't read the wrong values 
-    memset(h_y, 0, final_layer_size * sizeof(float)); // zero out the output layer to ensure that we don't read the wrong values
+    // Clean up host and device allocations.
+    freeNeuralNet(&d_nn);
 
-    /**
-     ** Forward propagation with shared memory
-     **/
-    // Copy x to device memory again (since it was modified in the previous loop with the device-to-device copy)
-    cudaMemcpy(d_x, h_x, N * sizeof(float), cudaMemcpyHostToDevice);
+    // Reallocate memory for the device
+    NeuralNet d_nn_shared;
+    allocateNeuralNet(&d_nn_shared, N, M);
+    
+    // Copy x and W to device memory
+    cudaMemcpy(d_nn_shared.x, h_x, (N+2*RADIUS) * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_nn_shared.W, h_W, N * R * sizeof(float), cudaMemcpyHostToDevice);
+
 
     printf("Shared memory:\t\t");
 
     tstart = hpc_gettime();
     // Forward propagation with shared memory
-    int current_size = N;
     for (int t = 1; t <= K - 1; t++)
     {
-        int output_layer_size = compute_layer_size(current_size, t);
+        int in_sz = input_size(N, t);
+        int out_sz = output_size(N, t);
         
         // Launch the kernel
-        forward_propagation_shared<<<(current_size + BLKDIM - 1)/BLKDIM, BLKDIM>>>(
-            d_x,
-            d_W,
-            d_y,
-            current_size
+        forward_propagation_shared<<<(out_sz + BLKDIM - 1) / BLKDIM, BLKDIM>>>(
+            d_nn_shared.x, d_nn_shared.W, d_nn_shared.y,
+            in_sz, out_sz
         );
-
-        cudaDeviceSynchronize();
 
         if (t < K - 1)
         {
             // Swap the input and output arays if we are not at the last layer
-            float *temp = d_x;
-            d_x = d_y;
-            d_y = temp;
-            current_size = output_layer_size;
+            float *temp = d_nn_shared.x;
+            d_nn_shared.x = d_nn_shared.y;
+            d_nn_shared.y = temp;
         }
     }
+    cudaDeviceSynchronize();
     // Stop the time
     tstop = hpc_gettime();
     tshared = tstop - tstart;
@@ -323,17 +309,27 @@ int main(int argc, char *argv[])
     printf("%fs (%.2fx speedup)\n", tshared, tnoshared / tshared);
 
     // Calculate throughput
-    shared_throughput = compute_throughput(tshared, N, K);
-    printf("Throughput: %f items/second\n", shared_throughput);
-
+    shared_throughput = compute_throughput(N, K, tshared);
+    printf("Throughput:\t\t%f items/second\n", shared_throughput);
 
     // Copy the output layer back to the host
-    cudaMemcpy(h_y, d_y, final_layer_size * sizeof(float), cudaMemcpyDeviceToHost);
+    h_y_shared = (float *)malloc((final_layer_size+(2*RADIUS)) * sizeof(float)); 
+    cudaMemcpy(h_y_shared, d_nn_shared.y, (final_layer_size+(2*RADIUS)) * sizeof(float), cudaMemcpyDeviceToHost);
 
-    // Free device memory
-    cudaFree(d_x); cudaFree(d_W); cudaFree(d_y);
-    // Free host memory
-    free(h_x); free(h_W); free(h_y);
+    // Check if the results are the same
+    int good = memcmp(h_y, h_y_shared, final_layer_size * sizeof(float)) == 0;
+    // Compare only the actual output size, excluding padding
+    if (good)
+        printf("Results are the same.\n");
+    else
+        printf("Results are different!\n");
 
-    return EXIT_SUCCESS;
+    // Clean up host and device allocations.
+    freeNeuralNet(&d_nn_shared);
+    free(h_x); h_x = NULL;
+    free(h_W); h_W = NULL;
+    free(h_y); h_y = NULL;
+    free(h_y_shared); h_y_shared = NULL;
+
+    return EXIT_SUCCESS;;
 }
