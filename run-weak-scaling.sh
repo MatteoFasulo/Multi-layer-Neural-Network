@@ -8,6 +8,6 @@
 #SBATCH --partition=l40
 echo "== Running OpenMP version =="
 gcc -std=c99 -Wall -Wpedantic -fopenmp multi-layer-nn.c -o multi-layer-nn -lm
-nvcc cuda-multi-layer-nn.cu -o cuda-multi-layer-nn
+#nvcc cuda-multi-layer-nn.cu -o cuda-multi-layer-nn
 bash weak-scaling.sh > csv/weak_scaling.csv
 echo "== End of Job =="

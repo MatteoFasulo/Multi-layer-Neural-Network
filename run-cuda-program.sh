@@ -8,7 +8,7 @@
 #SBATCH --output slurm-%j.out
 #SBATCH --partition=l40
 echo "== Compiling CUDA =="
-gcc -std=c99 -Wall -Wpedantic -fopenmp multi-layer-nn.c -o multi-layer-nn -lm
+#gcc -std=c99 -Wall -Wpedantic -fopenmp multi-layer-nn.c -o multi-layer-nn -lm
 nvcc cuda-multi-layer-nn.cu -o cuda-multi-layer-nn
 #echo "== Test with CUDA =="
 #./cuda-multi-layer-nn 1048576 100000 3
