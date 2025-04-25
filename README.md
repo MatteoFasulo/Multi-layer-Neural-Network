@@ -5,9 +5,9 @@ This repository contains a multi-layer neural network implementation in C with O
 ![Network Architecture](./img/network.drawio.png)
 
 While layers execute sequentially ($k \to k+1$), computing the output $\mathbf{y}^{(k+1)} \in \mathbb{R}^{M}$ (where $M=N-R+1$) from input $\mathbf{x}^{(k)} \in \mathbb{R}^{N}$ is parallelizable. Each output element $y^{(k+1)}_{i}$ involves an independent dot product and activation:
-$$
+```math
   y^{(k+1)}_{i} = \sigma\Bigl(\sum_{r=0}^{R-1} W^{(k)}_{i,r} \; x^{(k)}_{i+r} + b^{(k)}_{i}\Bigr), \quad \text{for } i = 0, \dots, M-1.
-$$
+```
 Key challenges are handling redundant reads of shared input elements and ensuring coalesced memory access on GPUs.
 
 ## Compile
@@ -36,7 +36,7 @@ Two memory strategies were compared:
 
 - $\textbf{Shared Memory Caching:}$ Threads within a block collaboratively load a tile of $\mathbf{x}^{(k)}$ (including halo regions for the receptive field $R$) into fast on-chip shared memory. This reduces global memory traffic by reusing shared input elements but still requires global reads for unique weights $W^{(k)}_{i,\cdot}$.
 
-GPU buffers (input $\mathbf{x}$, weights $W$, output $\mathbf{y}$) are managed within a single $\texttt{NeuralNet}$ struct, allocated contiguously to minimize fragmentation using a centered‐stencil indexing ($\mathrm{RADIUS}=(R-1)/2$). Layer dimensions are computed dynamically. After each layer's computation, input and output pointers ($\mathbf{x}, \mathbf{y}$) within the struct are swapped, avoiding redundant memory copies. Host-side timers ($\texttt{hpc\_gettime}$) measure end-to-end execution time, averaged over multiple trials. Throughput is calculated as total output elements computed across all layers per second.
+GPU buffers (input $\mathbf{x}$, weights $W$, output $\mathbf{y}$) are managed within a single $\texttt{NeuralNet}$ struct, allocated contiguously to minimize fragmentation using a centered‐stencil indexing ($\mathrm{RADIUS}=(R-1)/2$). Layer dimensions are computed dynamically. After each layer's computation, input and output pointers ($\mathbf{x}, \mathbf{y}$) within the struct are swapped, avoiding redundant memory copies. Host-side timers ($\texttt{hpc-gettime}$) measure end-to-end execution time, averaged over multiple trials. Throughput is calculated as total output elements computed across all layers per second.
 
 ## Run
 
@@ -129,14 +129,14 @@ The following figure presents the speedup of CUDA implementations relative to th
 ## Appendix: Sliding-Window Reformulation
 
 Given an input vector $\mathbf{x} = [x_0, x_1, \ldots, x_{N-1}]$ of dimension $N$ and a receptive field size $R$, the output vector $\mathbf{y}$ has a dimension $M = N - R + 1$. For an example case where $N=5$ and $R=3$, the output dimension is $M = 3$. The first two output elements ($y_0, y_1$) are computed individually as:
-$$
+```math
   y_0 = \sigma\bigl(x_0 W_{0,0} + x_1 W_{0,1} + x_2 W_{0,2} + b_0\bigr), \\
   y_1 = \sigma\bigl(x_1 W_{1,0} + x_2 W_{1,1} + x_3 W_{1,2} + b_1\bigr).
-$$
+```
 Here, $W_{i,j}$ represents the weight connecting the $j$-th input in the window for output $i$ to the $i$-th output neuron, and $b_i$ is the bias for the $i$-th output neuron. Weights are generally *not* shared between different output neurons in this locally connected formulation.
 
 To potentially improve data locality and leverage matrix operations, one can construct an intermediate matrix $X$ by applying a sliding window to the input vector $\mathbf{x}$ (often called `im2col` or `unfold`):
-$$
+```math
   X =
   \begin{bmatrix}
     x_0 & x_1 & \cdots & x_{R-1} \\
@@ -145,11 +145,11 @@ $$
     x_{M-1} & x_{M} & \cdots & x_{N-1}
   \end{bmatrix}
   \in \mathbb{R}^{M\times R}.
-$$
+```
 Let $W \in \mathbb{R}^{M \times R}$ be the weight matrix where row $i$ contains the weights for output $y_i$, and let $\mathbf{b} \in \mathbb{R}^{M}$ be the bias vector. The entire output vector $\mathbf{y} \in \mathbb{R}^{M}$ can then be expressed as:
-$$
+```math
   \mathbf{y} = \sigma\bigl(\text{diag}(X W^\top) + \mathbf{b}\bigr).
-$$
+```
 In this equation, $\text{diag}(\cdot)$ extracts the main diagonal of the $M \times M$ matrix product $X W^\top$, yielding the required weighted sums.
 
 Although this sliding-window (`im2col`) approach enables potentially fully coalesced memory reads and leverages highly optimized Basic Linear Algebra Subprograms (BLAS) for the internal matrix–matrix product ($X W^\top$), it introduces complexity and overhead. Firstly, explicit transformation of the input activations of each layer into the matrix $X$ can be costly, potentially compensating for the gains in BLAS performance, especially for small $R$ or deep networks requiring repeated transformations. Secondly, it's crucial to note that even after performing the computation via $X W^\top$, the desired result is the vector $\mathbf{y}$ obtained from the *diagonal* (plus bias and activation). This output vector $\mathbf{y}$ is analogous in structure to the original input vector $\mathbf{x}$; it is **not** automatically in a matrix format (like $X$) suitable for direct use as an operand in a subsequent layer's computation if that layer also relies on a GEMM-based strategy (e.g., another `im2col` followed by matrix multiplication). Such a subsequent layer would require its *own* `im2col` transformation applied to $\mathbf{y}$. Consequently, considering the transformation overhead and the fact that the output requires further processing for subsequent GEMM-based layers, the direct, per-neuron formulation might be preferred for clarity, simplicity, and potentially better end-to-end performance in certain scenarios.
