@@ -206,6 +206,20 @@ int main(int argc, char *argv[])
         return EXIT_FAILURE;
     }
 
+    // Check that input is a power of 2
+    if (N & (N - 1))
+    {
+        fprintf(stderr, "N must be a power of 2.\n");
+        return EXIT_FAILURE;
+    }
+
+    // Check that R is odd
+    if (R % 2 == 0)
+    {
+        fprintf(stderr, "R must be odd.\n");
+        return EXIT_FAILURE;
+    }
+
     // Compute the size of the first output layer
     M = N - (R - 1);
 
