@@ -264,7 +264,7 @@ int main(int argc, char *argv[])
     fill(h_W, (size_t)N0_initial * R);
 
     /* --- Test without shared memory --- */
-    printf("Running without shared memory...\n");
+    printf("No shared memory:\t");
     allocateNeuralNet(&d_nn, N0_initial);
     cudaMemcpy(d_nn.x, h_x_padded_initial, (N0_initial + 2 * RADIUS) * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_nn.W, h_W, (size_t)N0_initial * R * sizeof(float), cudaMemcpyHostToDevice);
@@ -305,14 +305,14 @@ int main(int argc, char *argv[])
         cudaMemcpy(h_y_check_no_shared, d_nn.y, (final_layer_unpadded_size + 2*RADIUS) * sizeof(float), cudaMemcpyDeviceToHost);
     }
     
-    printf("Time (no shared): %.4f s\n", tnoshared);
+    printf("%fs\n", tnoshared);
     throughput_val = compute_throughput(N0_initial, K_total_layers, tnoshared);
-    printf("Throughput (no shared): %.2f items/sec\n", throughput_val);
+    printf("Throughput:\t\t%f items/second\n", throughput_val);
     freeNeuralNet(&d_nn);
 
 
     /* --- Test with shared memory --- */
-    printf("\nRunning with shared memory...\n");
+    printf("Shared memory:\t\t");
     allocateNeuralNet(&d_nn_shared, N0_initial);
     cudaMemcpy(d_nn_shared.x, h_x_padded_initial, (N0_initial + 2 * RADIUS) * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_nn_shared.W, h_W, (size_t)N0_initial * R * sizeof(float), cudaMemcpyHostToDevice);
@@ -348,12 +348,9 @@ int main(int argc, char *argv[])
         cudaMemcpy(h_y_check_shared, d_nn_shared.y, (final_layer_unpadded_size + 2*RADIUS) * sizeof(float), cudaMemcpyDeviceToHost);
     }
 
-    printf("Time (shared): %.4f s\n", tshared);
+    printf("%fs (%.2fx speedup)\n", tshared, tnoshared / tshared);
     shared_throughput_val = compute_throughput(N0_initial, K_total_layers, tshared);
-    printf("Throughput (shared): %.2f items/sec\n", shared_throughput_val);
-    if (tnoshared > 0 && tshared > 0) {
-        printf("Speedup (shared vs no shared): %.2fx\n", tnoshared / tshared);
-    }
+    printf("Throughput:\t\t%f items/second\n", shared_throughput_val);
     freeNeuralNet(&d_nn_shared);
 
     /* --- Verification --- */
