@@ -40,43 +40,41 @@
 /**
  * Neural network struct.
  * @param base The base pointer for the allocated memory.
- * @param x The input layer.
+ * @param x The input layer (padded).
  * @param W The weights.
- * @param y The output layer.
+ * @param y The output layer (padded).
  */
  typedef struct {
     float *base;   /* original cudaMalloc pointer */
-    float *x;      /* input buffer */
-    float *W;      /* weight buffer */
-    float *y;      /* output buffer */
+    float *x;      /* input buffer (padded: N_max + 2*RADIUS) */
+    float *W;      /* weight buffer (N_max * R) */
+    float *y;      /* output buffer (padded: M_max + 2*RADIUS, M_max = N_max - (R-1)) */
 } NeuralNet;
 
-/* Compute input size for layer `t`: layer 1 sees N, layer 2 sees N-(R-1), ... */
-static inline int input_size(int N0, int layer) {
-    return N0 - (layer-1)*(R-1);
-}
-
-/* Compute output size of layer `t`: #neurons = N0 - t*(R-1) */
-static inline int output_size(int N0, int layer) {
-    return N0 - layer*(R-1);
+/* Compute output size of layer `t` (unpadded): #neurons = N0 - t*(R-1) */
+/* layer_num_1_based is the computation step number (1 to K-1) */
+static inline int unpadded_output_size(int N0, int layer_num_1_based) {
+    return N0 - layer_num_1_based * (R - 1);
 }
 
 /* Allocate one big chunk for x, W, and y, then slice it up */
-void allocateNeuralNet(NeuralNet *net, int N, int M) {
-    size_t size_x = (N + 2 * RADIUS) * sizeof(float);
-    size_t size_W = N * R * sizeof(float);
-    size_t size_y = (M + 2 * RADIUS) * sizeof(float);
-    size_t total_size = size_x + size_W + size_y;
+/* N_initial is the number of neurons in the very first input layer (unpadded) */
+void allocateNeuralNet(NeuralNet *net, int N_initial) {
+    size_t size_x_padded = (N_initial + 2 * RADIUS) * sizeof(float);
+    size_t size_W = (size_t)N_initial * R * sizeof(float);
+    size_t size_y_padded = (N_initial + 2 * RADIUS) * sizeof(float);
+    size_t total_size = size_x_padded + size_W + size_y_padded;
+    cudaError_t err;
 
-    cudaError_t err = cudaMalloc(&net->base, total_size);
+    err = cudaMalloc((void**)&net->base, total_size);
     if (err != cudaSuccess) {
         fprintf(stderr, "cudaMalloc failed: %s\n", cudaGetErrorString(err));
         exit(EXIT_FAILURE);
     }
-    
+
     net->x = net->base;
-    net->W = (float *)((char *)net->base + size_x);
-    net->y = (float *)((char *)net->base + size_x + size_W);
+    net->W = (float *)((char *)net->base + size_x_padded);
+    net->y = (float *)((char *)net->base + size_x_padded + size_W);
 }
 
 /* Free the single allocation */
@@ -87,263 +85,307 @@ void freeNeuralNet(NeuralNet *net) {
     }
 }
 
-/* Define the Sigmoid function using the math.h lib*/
-/**
- * Sigmoid activation function.
- *
- * @param v Input value.
- * @return The sigmoid of the input value.
- */
-__device__ float sigmoid(const float v)
+/* Define the Sigmoid function */
+__device__ float sigmoid_device(const float v)
 {
     return 1.0f / (1.0f + expf(-v));
 }
 
 /* Define the fill function */
-/**
- * Fill an array with random values.
- *
- * @param arr The array to fill.
- * @param size The size of the array.
- */
 void fill(float *arr, size_t size)
 {
-    for (size_t i = 0; i < size; ++i)
+    size_t i;
+    for (i = 0; i < size; ++i)
     {
-        arr[i] = (float)rand() / (float)RAND_MAX;
+        arr[i] = ((float)rand() / (float)RAND_MAX) * 2.0f - 1.0f; /* e.g., -1 to 1 */
     }
 }
 
 /* CPU-side throughput calculation: sum output sizes of layers 1..K-1 */
-double compute_throughput(long long N0, int K, double secs) {
-    long long total = 0;
-    for (int t = 1; t <= K-1; ++t)
-        total += output_size((int)N0, t);
-    return total / secs;
+double compute_throughput(long long N0_initial, int K_total_layers, double secs) {
+    long long total_neurons_computed = 0;
+    int t;
+    /* K_total_layers includes the input layer. K-1 computation steps. */
+    for (t = 1; t <= K_total_layers - 1; ++t) { /* t is the computation step number */
+        total_neurons_computed += unpadded_output_size((int)N0_initial, t);
+    }
+    if (secs == 0) return 0;
+    return (double)total_neurons_computed / secs;
 }
 
-/* Define the forward_propagation kernel without shared memory */
+/*
+ * Forward propagation kernel without shared memory.
+ */
 __global__ void forward_propagation(
-    const float* x,
+    const float* x_padded,
     const float* W,
-    float* y,
-    int out_size
+    float* y_padded,
+    int current_out_size_unpadded
 ) {
-    const int index = threadIdx.x + blockIdx.x * blockDim.x + RADIUS;
-    if (index >= out_size) return;
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    int offset;
+    int k_stencil_element;
 
+    if (gtid >= current_out_size_unpadded) return;
+
+    /* padded_idx_center is where gtid's output is written and where its central input is read */
+    const int padded_idx_center = gtid + RADIUS;
     float sum = BIAS;
 
-    #pragma unroll
-    for (int offset = -RADIUS; offset <= RADIUS; offset++) {
-        sum += x[index + offset] * W[index + out_size * (offset + RADIUS)];
+    for (offset = -RADIUS, k_stencil_element = 0; offset <= RADIUS; ++offset, ++k_stencil_element) {
+        sum += x_padded[padded_idx_center + offset] * W[gtid * R + k_stencil_element];
     }
 
-    y[index] = sigmoid(sum);
+    y_padded[padded_idx_center] = sigmoid_device(sum);
 }
 
-/* Define the forward_propagation kernel with shared memory */
+/*
+ * Forward propagation kernel with shared memory,
+ */
 __global__ void forward_propagation_shared(
-    const float* x,
+    const float* x_padded,
     const float* W,
-    float* y,
-    int in_size,
-    int out_size
+    float* y_padded,
+    int N0_initial_padded_size,
+    int current_out_size_unpadded
 ) {
-    // Shared memory for the input stencil window
-    __shared__ float temp[BLKDIM + 2 * RADIUS];
+    __shared__ float s_tile[BLKDIM + 2 * RADIUS];
 
-    const int gindex = threadIdx.x + blockIdx.x * blockDim.x + RADIUS;
-    const int lindex = threadIdx.x + RADIUS;
+    const int gtid = blockIdx.x * blockDim.x + threadIdx.x;
+    const int gindex_padded_center = gtid + RADIUS;
+    const int lindex_shared_center = threadIdx.x + RADIUS;
+
+    int k_stencil_element;
+    float sum;
 
     /* Read input elements into shared memory */
-    temp[lindex] = x[gindex];
+    if (gindex_padded_center < N0_initial_padded_size) {
+        s_tile[lindex_shared_center] = x_padded[gindex_padded_center];
+    } else {
+        s_tile[lindex_shared_center] = 0.0f;
+    }
+
+    /* First RADIUS threads load left and right halos for the block */
     if (threadIdx.x < RADIUS) {
-        temp[lindex - RADIUS] = x[gindex - RADIUS];
-        temp[lindex + blockDim.x] = x[gindex + blockDim.x];
+        /* Load left halo element: s_tile[lindex_shared_center - RADIUS] from x_padded[gindex_padded_center - RADIUS] */
+        if (gindex_padded_center - RADIUS >= 0) {
+            s_tile[lindex_shared_center - RADIUS] = x_padded[gindex_padded_center - RADIUS];
+        } else {
+             s_tile[lindex_shared_center - RADIUS] = 0.0f;
+        }
+
+        /* Load right halo element: s_tile[lindex_shared_center + BLKDIM] from x_padded[gindex_padded_center + BLKDIM] */
+        if (gindex_padded_center + BLKDIM < N0_initial_padded_size) { // Check upper bound of x_padded
+            s_tile[lindex_shared_center + BLKDIM] = x_padded[gindex_padded_center + BLKDIM];
+        } else {
+            s_tile[lindex_shared_center + BLKDIM] = 0.0f; // Pad if attempting to read beyond end
+        }
     }
     __syncthreads();
 
-    float sum = BIAS;
+    /* only compute if gtid is a valid output neuron for this layer */
+    if (gtid >= current_out_size_unpadded) return;
 
-    #pragma unroll
-    for (int offset = -RADIUS ; offset <= RADIUS ; offset++) {
-        sum += temp[lindex + offset] * W[gindex + out_size * (offset + RADIUS)];
+    sum = BIAS;
+
+    for (k_stencil_element = 0; k_stencil_element < R; ++k_stencil_element) {
+        int offset_from_center = k_stencil_element - RADIUS;
+        sum += s_tile[lindex_shared_center + offset_from_center] * W[gtid * R + k_stencil_element];
     }
 
-    y[gindex] = sigmoid(sum);
+    y_padded[gindex_padded_center] = sigmoid_device(sum);
 }
 
 int main(int argc, char *argv[])
 {
-    float *h_x, *h_W, *h_y, *h_y_shared; // Host memory for x, W, and y
-    int N = BLKDIM;  // Number of neurons in the first layer
-    int K = 2;     // Number of layers
-    int M;
-    double tstart, tstop, tnoshared, tshared; // Timers
-    double throughput, shared_throughput; // Throughput in items per second
-
-    if (argc > 3)
-    {
-        fprintf(stderr, "Usage: %s [N (default %d)] [K (default %d)]\n",
-                argv[0], N, K);
-        return EXIT_FAILURE;
-    }
-    if (argc >= 2)
-        N = atoi(argv[1]);
-    if (argc == 3)
-        K = atoi(argv[2]);
-
-    // Validate the input arguments
-    if (K < 2)
-    {
-        fprintf(stderr, "K must be greater than 1.\n");
-        return EXIT_FAILURE;
-    }
-    if (N < 1)
-    {
-        fprintf(stderr, "N must be a positive integer.\n");
-        return EXIT_FAILURE;
-    }
-
-    // Check that input is a power of 2
-    if (N & (N - 1))
-    {
-        fprintf(stderr, "N must be a power of 2.\n");
-        return EXIT_FAILURE;
-    }
-
-    // Check that R is odd
-    if (R % 2 == 0)
-    {
-        fprintf(stderr, "R must be odd.\n");
-        return EXIT_FAILURE;
-    }
-
-    // Compute the size of the first output layer
-    M = N - (R - 1);
-
+    float *h_x_padded_initial, *h_W, *h_y_check_no_shared, *h_y_check_shared;
+    int N0_initial = 1024;
+    int K_total_layers = 2;
+    double tstart, tstop, tnoshared = 0.0, tshared = 0.0;
+    double throughput_val, shared_throughput_val;
     NeuralNet d_nn;
-    allocateNeuralNet(&d_nn, N, M);
+    NeuralNet d_nn_shared;
+    int t; /* Loop variable for layers */
+    int final_layer_unpadded_size;
+    int current_layer_unpadded_output_size;
+    int i; /* Generic loop variable */
+    int verification_failed = 0;
 
-    // Allocate host memory for x, W
-    h_x = (float *)malloc((N+2*RADIUS)*sizeof(float)); fill(h_x, (N+2*RADIUS));
-    h_W = (float *)malloc(N*R*sizeof(float)); fill(h_W, N * R);
-    
-    // Copy x and W to device memory
-    cudaMemcpy(d_nn.x, h_x, (N+2*RADIUS)*sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_nn.W, h_W, N*R*sizeof(float), cudaMemcpyHostToDevice);
+    if (argc > 3) {
+        fprintf(stderr, "Usage: %s [N_initial (default %d)] [K_total_layers (default %d)]\n",
+                argv[0], N0_initial, K_total_layers);
+        return EXIT_FAILURE;
+    }
+    if (argc >= 2) N0_initial = atoi(argv[1]);
+    if (argc >= 3) K_total_layers = atoi(argv[2]);
 
-    int final_layer_size = output_size(N, K - 1);
+    /* Validate inputs */
+    if (K_total_layers < 2) {
+        fprintf(stderr, "K_total_layers must be at least 2 (input + one output layer).\n");
+        return EXIT_FAILURE;
+    }
+    if (N0_initial < 1) {
+        fprintf(stderr, "N_initial must be a positive integer.\n");
+        return EXIT_FAILURE;
+    }
+    if (R % 2 == 0) {
+        fprintf(stderr, "R (stencil size) must be odd for a centered stencil.\n");
+        return EXIT_FAILURE;
+    }
+    if ( (K_total_layers > 1) && (unpadded_output_size(N0_initial, K_total_layers - 1) < 1) ) {
+        fprintf(stderr, "Network configuration results in zero or negative neurons in the final layer.\n");
+        fprintf(stderr, "N0=%d, K=%d, R=%d. Final layer would have %d neurons.\n",
+                N0_initial, K_total_layers, R, unpadded_output_size(N0_initial, K_total_layers-1));
+        return EXIT_FAILURE;
+    }
+    if (N0_initial < R && K_total_layers > 1) {
+         fprintf(stderr, "N_initial (%d) must be at least R (%d) for the first computation layer if K > 1.\n", N0_initial, R);
+         return EXIT_FAILURE;
+    }
 
-    printf("Number of neurons (N) = %d, Number of layers (K) = %d, Radius (R) = %d\n", N, K, R);
-    printf("BLKDIM = %d\n", BLKDIM);
+    printf("Configuration: N_initial=%d, K_total_layers=%d, R=%d, RADIUS=%d, BLKDIM=%d\n",
+           N0_initial, K_total_layers, R, RADIUS, BLKDIM);
 
-    /**
-     ** Forward propagation without shared memory
-     **/
-    printf("No shared memory:\t");
+    /* Allocate host memory */
+    h_x_padded_initial = (float *)malloc((N0_initial + 2 * RADIUS) * sizeof(float));
+    h_W = (float *)malloc((size_t)N0_initial * R * sizeof(float));
+    if (!h_x_padded_initial || !h_W) {
+        fprintf(stderr, "Host malloc failed.\n");
+        return EXIT_FAILURE;
+    }
 
-    // Start the time
+    /* Fill initial host data */
+    /* Initialize padding regions in h_x_padded_initial to 0 */
+    for (i = 0; i < RADIUS; ++i) {
+        h_x_padded_initial[i] = 0.0f;
+        h_x_padded_initial[N0_initial + RADIUS + i] = 0.0f;
+    }
+    fill(h_x_padded_initial + RADIUS, N0_initial); /* Fill the actual N0_initial data */
+    fill(h_W, (size_t)N0_initial * R);
+
+    /* --- Test without shared memory --- */
+    printf("Running without shared memory...\n");
+    allocateNeuralNet(&d_nn, N0_initial);
+    cudaMemcpy(d_nn.x, h_x_padded_initial, (N0_initial + 2 * RADIUS) * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_nn.W, h_W, (size_t)N0_initial * R * sizeof(float), cudaMemcpyHostToDevice);
+
+    cudaDeviceSynchronize();
     tstart = hpc_gettime();
-    
-    // Forward propagation without shared memory
-    for (int t = 1; t <= K - 1; t++)
-    {
-        int out_sz = output_size(N, t);
 
-        // Launch the kernel
-        forward_propagation<<<(out_sz + BLKDIM - 1) / BLKDIM, BLKDIM>>>(
+    for (t = 1; t <= K_total_layers - 1; ++t) {
+        current_layer_unpadded_output_size = unpadded_output_size(N0_initial, t);
+        if (current_layer_unpadded_output_size < 1) {
+             fprintf(stderr, "Layer %d would have %d neurons. Stopping.\n", t, current_layer_unpadded_output_size);
+             break;
+        }
+
+        forward_propagation<<<(current_layer_unpadded_output_size + BLKDIM - 1) / BLKDIM, BLKDIM>>>(
             d_nn.x, d_nn.W, d_nn.y,
-            out_sz
+            current_layer_unpadded_output_size
         );
 
-        if (t < K - 1)
-        {
-            // Swap the input and output arays if we are not at the last layer
-            float *temp = d_nn.x;
+        /* Swap buffers for next iteration, unless it's the last one */
+        if (t < K_total_layers - 1) {
+            float *temp_ptr = d_nn.x;
             d_nn.x = d_nn.y;
-            d_nn.y = temp;
+            d_nn.y = temp_ptr;
         }
     }
     cudaDeviceSynchronize();
-    // Stop the time
     tstop = hpc_gettime();
     tnoshared = tstop - tstart;
-    printf("%fs\n", tnoshared);
 
-    // Calculate throughput
-    throughput = compute_throughput(N, K, tnoshared);
-    printf("Throughput:\t\t%f items/second\n", throughput);
+    final_layer_unpadded_size = unpadded_output_size(N0_initial, K_total_layers - 1);
+    if (final_layer_unpadded_size < 1 && K_total_layers > 1) final_layer_unpadded_size = 0;
+    
+    h_y_check_no_shared = (float *)malloc((final_layer_unpadded_size + 2*RADIUS) * sizeof(float));
+    if (!h_y_check_no_shared && final_layer_unpadded_size > 0) { fprintf(stderr, "Host malloc failed for no_shared results.\n"); return EXIT_FAILURE; }
 
-    // Copy the output layer back to the host
-    h_y = (float *)malloc((final_layer_size+(2*RADIUS)) * sizeof(float)); 
-    cudaMemcpy(h_y, d_nn.y, (final_layer_size+(2*RADIUS)) * sizeof(float), cudaMemcpyDeviceToHost);
-
-    // Clean up host and device allocations.
+    if (final_layer_unpadded_size > 0) {
+        cudaMemcpy(h_y_check_no_shared, d_nn.y, (final_layer_unpadded_size + 2*RADIUS) * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+    
+    printf("Time (no shared): %.4f s\n", tnoshared);
+    throughput_val = compute_throughput(N0_initial, K_total_layers, tnoshared);
+    printf("Throughput (no shared): %.2f items/sec\n", throughput_val);
     freeNeuralNet(&d_nn);
 
-    // Reallocate memory for the device
-    NeuralNet d_nn_shared;
-    allocateNeuralNet(&d_nn_shared, N, M);
-    
-    // Copy x and W to device memory
-    cudaMemcpy(d_nn_shared.x, h_x, (N+2*RADIUS) * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(d_nn_shared.W, h_W, N * R * sizeof(float), cudaMemcpyHostToDevice);
 
+    /* --- Test with shared memory --- */
+    printf("\nRunning with shared memory...\n");
+    allocateNeuralNet(&d_nn_shared, N0_initial);
+    cudaMemcpy(d_nn_shared.x, h_x_padded_initial, (N0_initial + 2 * RADIUS) * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_nn_shared.W, h_W, (size_t)N0_initial * R * sizeof(float), cudaMemcpyHostToDevice);
 
-    printf("Shared memory:\t\t");
-
+    cudaDeviceSynchronize();
     tstart = hpc_gettime();
-    // Forward propagation with shared memory
-    for (int t = 1; t <= K - 1; t++)
-    {
-        int in_sz = input_size(N, t);
-        int out_sz = output_size(N, t);
-        
-        // Launch the kernel
-        forward_propagation_shared<<<(out_sz + BLKDIM - 1) / BLKDIM, BLKDIM>>>(
-            d_nn_shared.x, d_nn_shared.W, d_nn_shared.y,
-            in_sz, out_sz
-        );
 
-        if (t < K - 1)
-        {
-            // Swap the input and output arays if we are not at the last layer
-            float *temp = d_nn_shared.x;
+    for (t = 1; t <= K_total_layers - 1; ++t) {
+        current_layer_unpadded_output_size = unpadded_output_size(N0_initial, t);
+         if (current_layer_unpadded_output_size < 1) break;
+
+        forward_propagation_shared<<<(current_layer_unpadded_output_size + BLKDIM - 1) / BLKDIM, BLKDIM>>>(
+            d_nn_shared.x,
+            d_nn_shared.W,
+            d_nn_shared.y,
+            N0_initial + 2 * RADIUS, /* Total elements in the padded x buffer */
+            current_layer_unpadded_output_size
+        );
+        if (t < K_total_layers - 1) {
+            float *temp_ptr = d_nn_shared.x;
             d_nn_shared.x = d_nn_shared.y;
-            d_nn_shared.y = temp;
+            d_nn_shared.y = temp_ptr;
         }
     }
     cudaDeviceSynchronize();
-    // Stop the time
     tstop = hpc_gettime();
     tshared = tstop - tstart;
-    // Print the time and speedup w.r.t the non-shared memory version
-    printf("%fs (%.2fx speedup)\n", tshared, tnoshared / tshared);
 
-    // Calculate throughput
-    shared_throughput = compute_throughput(N, K, tshared);
-    printf("Throughput:\t\t%f items/second\n", shared_throughput);
+    h_y_check_shared = (float *)malloc((final_layer_unpadded_size + 2*RADIUS) * sizeof(float));
+     if (!h_y_check_shared && final_layer_unpadded_size > 0) { fprintf(stderr, "Host malloc failed for shared results.\n"); return EXIT_FAILURE; }
 
-    // Copy the output layer back to the host
-    h_y_shared = (float *)malloc((final_layer_size+(2*RADIUS)) * sizeof(float)); 
-    cudaMemcpy(h_y_shared, d_nn_shared.y, (final_layer_size+(2*RADIUS)) * sizeof(float), cudaMemcpyDeviceToHost);
+    if (final_layer_unpadded_size > 0) {
+        cudaMemcpy(h_y_check_shared, d_nn_shared.y, (final_layer_unpadded_size + 2*RADIUS) * sizeof(float), cudaMemcpyDeviceToHost);
+    }
 
-    // Check if the results are the same
-    int good = memcmp(h_y, h_y_shared, final_layer_size * sizeof(float)) == 0;
-    // Compare only the actual output size, excluding padding
-    if (good)
-        printf("Results are the same.\n");
-    else
-        printf("Results are different!\n");
-
-    // Clean up host and device allocations.
+    printf("Time (shared): %.4f s\n", tshared);
+    shared_throughput_val = compute_throughput(N0_initial, K_total_layers, tshared);
+    printf("Throughput (shared): %.2f items/sec\n", shared_throughput_val);
+    if (tnoshared > 0 && tshared > 0) {
+        printf("Speedup (shared vs no shared): %.2fx\n", tnoshared / tshared);
+    }
     freeNeuralNet(&d_nn_shared);
-    free(h_x); h_x = NULL;
-    free(h_W); h_W = NULL;
-    free(h_y); h_y = NULL;
-    free(h_y_shared); h_y_shared = NULL;
 
-    return EXIT_SUCCESS;;
+    /* --- Verification --- */
+    if (final_layer_unpadded_size > 0) {
+        printf("\nVerifying results...\n");
+        verification_failed = 0;
+        for (i = 0; i < final_layer_unpadded_size; ++i) {
+            /* skip padding */
+            float val_no_shared = h_y_check_no_shared[i + RADIUS];
+            float val_shared = h_y_check_shared[i + RADIUS];
+            if (fabsf(val_no_shared - val_shared) > 1e-5) {
+                fprintf(stderr, "Verification FAILED at index %d (unpadded): NoShared=%.6f, Shared=%.6f, Diff=%.6f\n",
+                        i, val_no_shared, val_shared, fabsf(val_no_shared - val_shared));
+                verification_failed = 1;
+                break;
+            }
+        }
+        if (!verification_failed) {
+            printf("Verification PASSED.\n");
+        }
+    } else {
+        printf("\nNo output neurons in final layer to verify (K=%d, N0=%d).\n", K_total_layers, N0_initial);
+    }
+
+
+    /* Clean up host memory */
+    free(h_x_padded_initial);
+    free(h_W);
+    if (final_layer_unpadded_size > 0) {
+        free(h_y_check_no_shared);
+        free(h_y_check_shared);
+    }
+
+    return verification_failed ? EXIT_FAILURE : EXIT_SUCCESS;
 }
