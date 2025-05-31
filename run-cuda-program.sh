@@ -13,5 +13,5 @@ nvcc cuda-multi-layer-nn.cu -o cuda-multi-layer-nn
 #echo "== Test with CUDA =="
 #./cuda-multi-layer-nn 1048576 100000 3
 echo "== Running CUDA version =="
-bash cuda-perf.sh > csv/cuda_perf4000.csv
+bash cuda-perf.sh > csv/cuda_perf1000.csv
 echo "== End of Job =="

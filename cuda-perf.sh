@@ -5,7 +5,7 @@
 
 CPU_PROG=./multi-layer-nn    # name of the executable
 GPU_PROG=./cuda-multi-layer-nn    # name of the executable
-K=4000                         # number of layers
+K=1000                         # number of layers
 NREPS=5                      # number of replications.
 CORES=`cat /proc/cpuinfo | grep processor | wc -l` # number of (logical) cores
 WORKLOAD=(131072 262144 524288 1048576 2097152)  # input sizes (2^17, 2^18, 2^19, 2^20, 2^21)
